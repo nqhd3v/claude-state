@@ -1,12 +1,19 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const app = new Hono();
 
-app.get("/", (c) => {
-  const data = exec("claude -p '/usage' --output-format json");
-  console.log(JSON.stringify({ data }));
+app.get("/", async (c) => {
+  const { stdout } = await execFileAsync(
+    "claude",
+    ["-p", "/usage", "--output-format", "json"],
+    { timeout: 60_000, maxBuffer: 1024 * 1024 },
+  );
+  console.log(JSON.stringify({ stdout }));
 
   return c.json({ message: "Bad request", statusCode: 400 });
 });
