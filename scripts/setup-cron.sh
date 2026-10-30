@@ -1,6 +1,6 @@
 #!/bin/sh
-# Installs crontab entries that call POST /sync every 20 minutes,
-# Mon-Fri 08:30-17:30 (08:30, 08:50, 09:10, ... 17:10, 17:30). Weekends skipped.
+# Installs crontab entries that call POST /sync every 10 minutes,
+# Mon-Fri 08:00-18:50 (08:00, 08:10, ... 18:40, 18:50). Weekends skipped.
 # Times follow the system timezone. Re-running replaces the previous entries.
 # Usage: scripts/setup-cron.sh [install|remove]   (default: install)
 set -eu
@@ -24,9 +24,7 @@ fi
 mkdir -p "$LOG_DIR"
 {
   [ -n "$current" ] && printf '%s\n' "$current"
-  echo "30,50 8 * * 1-5 $CMD $MARKER"
-  echo "10,30,50 9-16 * * 1-5 $CMD $MARKER"
-  echo "10,30 17 * * 1-5 $CMD $MARKER"
+  echo "*/10 8-18 * * 1-5 $CMD $MARKER"
 } | crontab -
 
 echo "Installed:"
