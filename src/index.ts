@@ -1,23 +1,39 @@
 import { serve } from "@hono/node-server";
-import dayjs, { type Dayjs } from "dayjs";
-import customParseFormat from "dayjs/plugin/customParseFormat.js";
-import timezone from "dayjs/plugin/timezone.js";
-import utc from "dayjs/plugin/utc.js";
 import { Hono } from "hono";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 process.loadEnvFile();
 
-dayjs.extend(customParseFormat);
-dayjs.extend(utc);
-dayjs.extend(timezone);
+// Same endpoint Claude Code's /usage screen reads. No model call, so no tokens
+// are spent. Internal and undocumented: it can change without notice.
+const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Claude Code's public OAuth client
 
-const execFileAsync = promisify(execFile);
+// Written by `claude` login on Linux. macOS keeps it in the Keychain instead.
+const CREDENTIALS_PATH =
+  process.env.CLAUDE_CREDENTIALS ??
+  join(homedir(), ".claude", ".credentials.json");
 
-type ClaudeResult = {
-  is_error: boolean;
-  result: string;
+type OAuth = {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number; // epoch ms
+  scopes?: string[];
+};
+
+type Credentials = { claudeAiOauth?: OAuth };
+
+type UsageWindow = {
+  utilization?: number | null;
+  resets_at?: string | null;
+};
+
+type UsageResponse = {
+  five_hour?: UsageWindow | null;
+  seven_day?: UsageWindow | null;
 };
 
 type Status = {
@@ -30,63 +46,13 @@ type Status = {
 
 type UsageLine = {
   percent: number;
-  resetAt?: Dayjs;
+  resetAt?: number; // unix seconds
 };
 
-async function runUsage(): Promise<ClaudeResult> {
-  const { stdout } = await execFileAsync(
-    "claude",
-    ["-p", "/usage", "--output-format", "json"],
-    { timeout: 60_000, maxBuffer: 1024 * 1024 },
-  );
-  return JSON.parse(stdout) as ClaudeResult;
-}
-
-// Parses e.g. "Oct 28, 2:19pm", "Oct 28, 2pm" or "2:19pm" as wall-clock time in
-// `zone`. The year is not printed, so pick the next occurrence that is not in the past.
-function parseReset(text: string, zone: string, now: Dayjs): Dayjs | undefined {
-  const today = now.tz(zone);
-  const hasDate = /^[A-Za-z]/.test(text);
-  const dated = hasDate ? text : `${today.format("MMM D")}, ${text}`;
-  const format = dated.includes(":") ? "YYYY MMM D, h:mma" : "YYYY MMM D, ha";
-
-  let resetAt = dayjs.tz(`${today.year()} ${dated}`, format, zone);
-  if (!resetAt.isValid()) return undefined;
-
-  if (!hasDate && resetAt.isBefore(now)) resetAt = resetAt.add(1, "day");
-  if (hasDate && resetAt.isBefore(now.subtract(1, "day")))
-    resetAt = resetAt.add(1, "year");
-  return resetAt;
-}
-
-// Hours from `now` until `resetAt`, rounded to 2 decimals.
-function hoursUntil(resetAt: Dayjs, now: Dayjs): number {
-  const hours = Math.max(0, resetAt.diff(now, "hour", true));
-  return Math.round(hours * 100) / 100;
-}
-
-// Matches e.g. "Current week (all models): 23% used · resets Oct 29, 4:59pm (Asia/Ho_Chi_Minh)"
-function parseLine(text: string, label: string, now: Dayjs): UsageLine | null {
-  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = text.match(
-    new RegExp(
-      `^\\s*${escaped}:\\s*(\\d+(?:\\.\\d+)?)% used(?:\\s*·\\s*resets\\s+(.+?)(?:\\s+\\(([^)]+)\\))?)?\\s*$`,
-      "m",
-    ),
-  );
-  if (!match) return null;
-  const [, percent, resets, timeZone] = match;
-  const zone = timeZone ?? dayjs.tz.guess();
-  return {
-    percent: Number(percent),
-    resetAt: resets ? parseReset(resets, zone, now) : undefined,
-  };
-}
-
 type Usage = {
-  now: Dayjs;
+  now: number; // epoch ms
   session: UsageLine;
-  week: UsageLine & { resetAt: Dayjs };
+  week: UsageLine & { resetAt: number };
 };
 
 class UsageError extends Error {
@@ -98,18 +64,98 @@ class UsageError extends Error {
   }
 }
 
-async function getUsage(): Promise<Usage> {
-  const usage = await runUsage();
-  if (usage.is_error)
-    throw new UsageError("claude returned an error", usage.result);
+async function refreshAccessToken(creds: Credentials, oauth: OAuth) {
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      refresh_token: oauth.refreshToken,
+      client_id: CLIENT_ID,
+      ...(oauth.scopes && { scope: oauth.scopes.join(" ") }),
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok)
+    throw new UsageError(
+      `token refresh returned ${res.status}`,
+      await res.text(),
+    );
 
-  const now = dayjs();
-  const session = parseLine(usage.result, "Current session", now);
-  const week = parseLine(usage.result, "Current week (all models)", now);
-  if (!session || !week || week.resetAt === undefined) {
-    throw new UsageError("could not parse usage", usage.result);
-  }
-  return { now, session, week: { ...week, resetAt: week.resetAt } };
+  const token = (await res.json()) as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in: number;
+  };
+  oauth.accessToken = token.access_token;
+  // Refresh tokens rotate: persist the new one or the next refresh fails.
+  oauth.refreshToken = token.refresh_token ?? oauth.refreshToken;
+  oauth.expiresAt = Date.now() + token.expires_in * 1000;
+
+  const tmp = `${CREDENTIALS_PATH}.tmp`;
+  await writeFile(tmp, JSON.stringify(creds), { mode: 0o600 });
+  await rename(tmp, CREDENTIALS_PATH);
+  return oauth.accessToken;
+}
+
+// /status and /sync can overlap. A second refresh would replay the rotated token.
+let refreshing: Promise<string> | undefined;
+
+async function getAccessToken(): Promise<string> {
+  const creds = JSON.parse(
+    await readFile(CREDENTIALS_PATH, "utf8"),
+  ) as Credentials;
+  const oauth = creds.claudeAiOauth;
+  if (!oauth)
+    throw new UsageError("not logged in", `no OAuth in ${CREDENTIALS_PATH}`);
+
+  // Refresh a minute early.
+  if (oauth.expiresAt > Date.now() + 60_000) return oauth.accessToken;
+
+  refreshing ??= refreshAccessToken(creds, oauth).finally(() => {
+    refreshing = undefined;
+  });
+  return refreshing;
+}
+
+function unixSeconds(iso?: string | null): number | undefined {
+  return iso ? Math.floor(Date.parse(iso) / 1000) : undefined;
+}
+
+// Hours from `now` (epoch ms) until `resetAt` (unix seconds), rounded to 2 decimals.
+function hoursUntil(resetAt: number, now: number): number {
+  const hours = Math.max(0, (resetAt * 1000 - now) / 3_600_000);
+  return Math.round(hours * 100) / 100;
+}
+
+async function getUsage(): Promise<Usage> {
+  const res = await fetch(USAGE_URL, {
+    headers: {
+      Authorization: `Bearer ${await getAccessToken()}`,
+      "anthropic-beta": "oauth-2025-04-20",
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await res.text();
+  if (!res.ok)
+    throw new UsageError(`usage endpoint returned ${res.status}`, text);
+
+  const usage = JSON.parse(text) as UsageResponse;
+  const weekResetAt = unixSeconds(usage.seven_day?.resets_at);
+  if (weekResetAt === undefined)
+    throw new UsageError("could not parse usage", text);
+
+  return {
+    now: Date.now(),
+    session: {
+      percent: usage.five_hour?.utilization ?? 0,
+      resetAt: unixSeconds(usage.five_hour?.resets_at),
+    },
+    week: {
+      percent: usage.seven_day?.utilization ?? 0,
+      resetAt: weekResetAt,
+    },
+  };
 }
 
 // POST /api/usage-state on Workdesk, see workdesk/docs/api.md.
@@ -122,14 +168,14 @@ async function pushUsageState(
 
   const payload = {
     name: "claude",
-    measured_at: usage.now.unix(),
+    measured_at: Math.floor(usage.now / 1000),
     session: {
       used_pct: usage.session.percent,
-      resets_at: usage.session.resetAt?.unix() ?? null,
+      resets_at: usage.session.resetAt ?? null,
     },
     week: {
       used_pct: usage.week.percent,
-      resets_at: usage.week.resetAt.unix(),
+      resets_at: usage.week.resetAt,
     },
   };
 
@@ -149,8 +195,7 @@ function errorResponse(err: unknown) {
       body: { error: err.message, detail: err.detail },
       status: 502 as const,
     };
-  const e = err as { message: string; stderr?: string };
-  return { body: { error: e.message, stderr: e.stderr }, status: 500 as const };
+  return { body: { error: (err as Error).message }, status: 500 as const };
 }
 
 const app = new Hono();
@@ -161,7 +206,7 @@ app.get("/status", async (c) => {
     const status: Status = {
       session: session.percent,
       week: week.percent,
-      time: now.valueOf(),
+      time: now,
       weekResetIn: hoursUntil(week.resetAt, now),
     };
     if (session.resetAt !== undefined) {
@@ -195,17 +240,6 @@ app.post("/sync", async (c) => {
     console.error(`sync failed: ${JSON.stringify(body)}`);
     return c.json(body, status);
   }
-});
-
-app.get("/", async (c) => {
-  const { stdout } = await execFileAsync(
-    "claude",
-    ["-p", "/usage", "--output-format", "json"],
-    { timeout: 60_000, maxBuffer: 1024 * 1024 },
-  );
-  console.log(JSON.stringify({ stdout }));
-
-  return c.json({ message: "Bad request", statusCode: 400 });
 });
 
 serve(
