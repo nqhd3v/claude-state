@@ -1,5 +1,5 @@
-Reads Claude plan usage and pushes it to Workdesk. Calls the endpoint behind
-Claude Code's `/usage` screen directly, so no tokens are spent.
+Reads Claude and Copilot plan usage and pushes it to Workdesk. Calls the endpoint
+behind Claude Code's `/usage` screen directly, so no tokens are spent.
 
 ```
 npm install
@@ -14,6 +14,10 @@ open http://localhost:3001/status
 - `POST /sync`: push usage to Workdesk (`scripts/setup-cron.sh` schedules this)
 
 Needs `API_URL`, `API_KEY` and optional `PORT` in `.env`.
+
+Set `COPILOT_TOKEN` to also sync Copilot; without it `/sync` skips Copilot. The
+token must belong to the Copilot user. It reads an undocumented GitHub endpoint,
+so `/sync` reports a failure there without affecting Claude.
 
 Needs `~/.claude/.credentials.json`, so run `claude` and `/login` once on the
 host. The token is refreshed and saved back to that file when it expires. Linux

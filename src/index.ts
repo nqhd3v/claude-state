@@ -12,6 +12,10 @@ const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Claude Code's public OAuth client
 
+// Reads the caller's own quota, which the billing API leaves out for seats paid
+// by an organization. Internal and undocumented: it can change without notice.
+const COPILOT_URL = "https://api.github.com/copilot_internal/user";
+
 // Written by `claude` login on Linux. macOS keeps it in the Keychain instead.
 const CREDENTIALS_PATH =
   process.env.CLAUDE_CREDENTIALS ??
@@ -44,6 +48,11 @@ type Status = {
   sessionResetIn?: number;
 };
 
+type UsageState = { name: "claude" | "copilot"; measured_at: number } & Record<
+  string,
+  unknown
+>;
+
 type UsageLine = {
   percent: number;
   resetAt?: number; // unix seconds
@@ -53,6 +62,13 @@ type Usage = {
   now: number; // epoch ms
   session: UsageLine;
   week: UsageLine & { resetAt: number };
+};
+
+type CopilotResponse = {
+  quota_reset_date_utc?: string | null;
+  quota_snapshots?: {
+    premium_interactions?: { percent_remaining?: number | null } | null;
+  } | null;
 };
 
 class UsageError extends Error {
@@ -158,15 +174,40 @@ async function getUsage(): Promise<Usage> {
   };
 }
 
-// POST /api/usage-state on Workdesk, see workdesk/docs/api.md.
-async function pushUsageState(
-  usage: Usage,
-): Promise<{ status: number; body: unknown }> {
-  const { API_URL, API_KEY } = process.env;
-  if (!API_URL || !API_KEY)
-    throw new Error("API_URL and API_KEY must be set in .env");
+async function getCopilotState(token: string): Promise<UsageState> {
+  const res = await fetch(COPILOT_URL, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "User-Agent": "claude-state",
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await res.text();
+  if (!res.ok)
+    throw new UsageError(`copilot endpoint returned ${res.status}`, text);
 
-  const payload = {
+  const usage = JSON.parse(text) as CopilotResponse;
+  const remaining =
+    usage.quota_snapshots?.premium_interactions?.percent_remaining;
+  const resetAt = unixSeconds(usage.quota_reset_date_utc);
+  if (typeof remaining !== "number" || resetAt === undefined)
+    throw new UsageError("could not parse copilot usage", text);
+
+  // Going over the limit is allowed, so clamp to what Workdesk accepts.
+  return {
+    name: "copilot",
+    measured_at: Math.floor(Date.now() / 1000),
+    month: {
+      used_pct: Math.min(100, Math.max(0, 100 - remaining)),
+      resets_at: resetAt,
+    },
+  };
+}
+
+async function getClaudeState(): Promise<UsageState> {
+  const usage = await getUsage();
+  return {
     name: "claude",
     measured_at: Math.floor(usage.now / 1000),
     session: {
@@ -178,11 +219,20 @@ async function pushUsageState(
       resets_at: usage.week.resetAt,
     },
   };
+}
+
+// POST /api/usage-state on Workdesk, see workdesk/docs/api.md.
+async function pushUsageState(
+  state: UsageState,
+): Promise<{ status: number; body: unknown }> {
+  const { API_URL, API_KEY } = process.env;
+  if (!API_URL || !API_KEY)
+    throw new Error("API_URL and API_KEY must be set in .env");
 
   const res = await fetch(new URL("/api/usage-state", API_URL), {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-workdesk-key": API_KEY },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(state),
     signal: AbortSignal.timeout(15_000),
   });
   const body = await res.json().catch(() => null);
@@ -196,6 +246,30 @@ function errorResponse(err: unknown) {
       status: 502 as const,
     };
   return { body: { error: (err as Error).message }, status: 500 as const };
+}
+
+// Never throws: one tool failing must not stop the other from syncing.
+async function syncTool(name: string, read: () => Promise<UsageState>) {
+  try {
+    const { status, body } = await pushUsageState(await read());
+    if (status !== 201) {
+      console.error(`${name} sync failed: ${status} ${JSON.stringify(body)}`);
+      return {
+        synced: false as const,
+        error: "workdesk rejected usage state",
+        status,
+        body,
+      };
+    }
+    return {
+      synced: true as const,
+      server_time: (body as { server_time?: number } | null)?.server_time,
+    };
+  } catch (err) {
+    const { body } = errorResponse(err);
+    console.error(`${name} sync failed: ${JSON.stringify(body)}`);
+    return { synced: false as const, ...body };
+  }
 }
 
 const app = new Hono();
@@ -221,25 +295,13 @@ app.get("/status", async (c) => {
 });
 
 app.post("/sync", async (c) => {
-  try {
-    const usage = await getUsage();
-    const { status, body } = await pushUsageState(usage);
-    if (status !== 201) {
-      console.error(`sync failed: ${status} ${JSON.stringify(body)}`);
-      return c.json(
-        { error: "workdesk rejected usage state", status, body },
-        502,
-      );
-    }
-    return c.json({
-      synced: true,
-      server_time: (body as { server_time?: number } | null)?.server_time,
-    });
-  } catch (err) {
-    const { body, status } = errorResponse(err);
-    console.error(`sync failed: ${JSON.stringify(body)}`);
-    return c.json(body, status);
-  }
+  const token = process.env.COPILOT_TOKEN;
+  const [claude, copilot] = await Promise.all([
+    syncTool("claude", getClaudeState),
+    token ? syncTool("copilot", () => getCopilotState(token)) : undefined,
+  ]);
+  const synced = claude.synced && (copilot?.synced ?? true);
+  return c.json({ synced, claude, copilot }, synced ? 200 : 502);
 });
 
 serve(
